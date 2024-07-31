@@ -7,7 +7,7 @@ import sys
 
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from math import floor
 
 from utils.translit_schema import translit_dict
