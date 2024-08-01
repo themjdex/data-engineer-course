@@ -263,7 +263,7 @@ class SynteticDataGenerator:
             for file in list_files:
                 if datetime.strptime(file[:10], '%Y-%m-%d').date() > diff_date and \
                         int(file[8:10]) % 2 != 0 and \
-                        file not in 'safe':
+                        'safe' not in file:
                     dates.append(file)
 
         # если найдены файлы, удовлетворяющие всем условиям, то шифруем их, а прежние удаляем от греха подальше
