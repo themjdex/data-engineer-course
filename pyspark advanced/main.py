@@ -4,13 +4,17 @@ import pyspark
 import argparse
 import logging
 import sys
+import os
 
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import broadcast
 from datetime import datetime, timedelta
 from typing import List, Dict
 from math import floor
+from cryptography.fernet import Fernet
 
 from utils.translit_schema import translit_dict
+from utils.crypto import hash_keys
 
 # заводим логгер для отсылки сообщений в терминал
 logger = logging.getLogger(__name__)
@@ -54,9 +58,20 @@ def start_session_and_prepare_data() -> Dict[
                                .persist(pyspark.StorageLevel.MEMORY_ONLY)
 
     translit_schema = spark.sparkContext.parallelize([translit_dict]) \
-                                        .persist(pyspark.StorageLevel.MEMORY_ONLY)
+                                    .persist(pyspark.StorageLevel.MEMORY_ONLY)
 
-    return {'spark': spark, 'names': names_rdd, 'cities': cities_rdd, 'emails': emails, 'translit_schema': translit_schema}
+    sc_crypt = spark.sparkContext.parallelize([hash_keys]) \
+                                 .persist(pyspark.StorageLevel.MEMORY_ONLY)
+    
+    crypt_hash_table = broadcast(spark.createDataFrame(sc_crypt))
+
+
+    return {'spark': spark, 
+            'names': names_rdd, 
+            'cities': cities_rdd, 
+            'emails': emails, 
+            'translit_schema': translit_schema,
+            'crypt_hash_table': crypt_hash_table}
 
 def finish_session(session: pyspark.sql.session.SparkSession) -> None:
     '''
@@ -69,7 +84,12 @@ def finish_session(session: pyspark.sql.session.SparkSession) -> None:
 
 
 class SynteticDataGenerator:
-    def __init__(self, row_count: int = 10, nullable: bool = False, **kwargs) -> None:
+    def __init__(self, 
+                 row_count: int = 10, 
+                 nullable: bool = False, 
+                 crypt_type: str = 'fernet', 
+                 need_check: str = 'no',
+                 **kwargs) -> None:
         '''
         Инициализация всех необходимых параметров и RDD
         Args:
@@ -80,17 +100,19 @@ class SynteticDataGenerator:
             cities (pyspark.rdd.RDD): RDD с городами
             emails (pyspark.rdd.RDD): RDD с доменами эд. почт
             translit_schema (pyspark.rdd.RDD): RDD со словарем для транслитерации
-
-        Returns:
-            None
+            crypt_hash_table (pyspark.rdd.RDD): RDD с ключами шифрования символов
+            crypt_type (str): тип выбранного шифрования для данных 'fernet' | 'dummy'
         '''
         self.row_count = row_count
         self.nullable = nullable
+        self.crypt_type = crypt_type
+        self.need_check = need_check
         self.spark = kwargs['spark']
         self.names = kwargs['names']
         self.cities = kwargs['cities']
         self.emails = kwargs['emails']
         self.translit_schema = kwargs['translit_schema']
+        self.crypt_hash_table = kwargs['crypt_hash_table']
         self.all_data = []
         
 
@@ -151,6 +173,15 @@ class SynteticDataGenerator:
         for elem in ages:
             registration_dates.append((current_date - timedelta(days=np.random.randint(1, 366))).strftime('%Y-%m-%d'))
 
+        # добавим тестовую первую строку для второй задачи
+        self.all_data.append({'id': 9999,
+                            'name': 'Marat',
+                            'email': 'test@test.ru',
+                            'city': 'Ufa',
+                            'age': 99,
+                            'salary': 99,
+                            'registration_date': '2024-08-01'})
+        
         # сшиваем всё в JSON-подобную структуру и помещаем в общие данные
         for i in range(len(ids)):
             row = {'id': ids[i],
@@ -172,6 +203,88 @@ class SynteticDataGenerator:
                     random_column = np.random.choice(['name', 'email', 'city', 'age', 'salary', 'registration_date'])
                     self.all_data[random_row][random_column] = None
 
+        # зашифровываем все данные, если это нужно
+        if self.crypt_type != 'no':
+            self._encrypt_data()
+        
+        # проверяем файлы за нечетные дни на наличие шифровки, если это нужно
+        if self.need_check != 'no':
+            self.check_last_csv()
+
+
+
+    def _encrypt_data(self) -> None:
+        '''
+        Функция шифрует каждый символ сгенерированных данных 
+        согласно спец. таблице или Fernet
+        '''
+        if self.crypt_type == 'dummy':
+            fields = ['id', 'name', 'email', 'city', 'age', 'salary', 'registration_date']
+            char_table = str.maketrans(self.crypt_hash_table.toPandas().to_dict()['_1'][0])
+
+            for row in self.all_data:
+                for key in fields:
+                    row[key] = str(row[key]).lower().translate(char_table)
+
+        elif self.crypt_type == 'fernet':
+            key = Fernet.generate_key()
+            cipher = Fernet(key)
+            encrypted_data = []
+
+            for row in self.all_data:
+                encrypt_rows = {}
+                for k, v in row.items():
+                    encrypted_value = cipher.encrypt(str(v).encode())
+                    encrypt_rows[k] = encrypted_value
+                encrypted_data.append(encrypt_rows)
+
+            self.all_data = encrypted_data
+
+        else:
+            return
+
+    def check_last_csv(self):
+        '''
+        Функция проверяет генерации за последние 2 месяца по нечетным дням и
+        производит их шифрование, если этого не было сделано
+        '''
+        # проверяем, что нужная директория в целом на месте
+        if not os.path.isdir(OUTPUT_PATH):
+            raise ValueError(f'{OUTPUT_PATH} не существует или не найден')
+        
+        # получаем список всех файлов
+        list_files = os.listdir(OUTPUT_PATH)
+
+        # если список файлов не пустой, то начинаем проверки 
+        if len(list_files) > 0:
+            current_date = datetime.now().date()
+            diff_date = current_date - timedelta(days=60)
+            dates = []
+            for file in list_files:
+                if datetime.strptime(file[:10], '%Y-%m-%d').date() > diff_date and \
+                        int(file[8:10]) % 2 != 0 and \
+                        file not in 'safe':
+                    dates.append(file)
+
+        # если найдены файлы, удовлетворяющие всем условиям, то шифруем их, а прежние удаляем от греха подальше
+        if len(dates) > 0:
+            key = Fernet.generate_key()
+            cipher = Fernet(key)
+            for file in dates:
+                with open(f'{OUTPUT_PATH}{file}', mode='r', newline='') as old_file, open(f'{OUTPUT_PATH}{file[:-4]}_safe.csv', mode='w', newline='') as new_file:
+                    reader = csv.reader(old_file)
+                    writer = csv.writer(new_file)
+
+                    header = next(reader)
+                    writer.writerow(header)
+
+                    for row in reader:
+                        encrypted_row = [cipher.encrypt(value.encode()) for value in row]
+                        writer.writerow(encrypted_row)
+                os.remove(f'{OUTPUT_PATH}{file}')
+                
+            
+
 
     def get_data(self) -> List[Dict]:
         '''
@@ -190,7 +303,10 @@ class SynteticDataGenerator:
         fieldnames = ['id','name', 'email', 'city', 'age', 'salary', 'registration_date']
 
         # задаем нужное название файла
-        path = f'{OUTPUT_PATH}{datetime.now().strftime('%Y-%m-%d')}-dev.csv'
+        if self.crypt_type == 'no':
+            path = f'{OUTPUT_PATH}{datetime.now().strftime('%Y-%m-%d')}-dev.csv'
+        else:
+            path = f'{OUTPUT_PATH}{datetime.now().strftime('%Y-%m-%d')}-dev_safe.csv'
 
         # записываем данные в файл
         if self.all_data:
@@ -200,7 +316,6 @@ class SynteticDataGenerator:
 
                 for row in self.all_data:
                     writer.writerow(row)
-
         else:
             raise Exception('Сначала нужно запустить collect_data()')
 
@@ -210,11 +325,18 @@ if __name__ == '__main__':
     '''
     примеры команд:
     1. python main.py --rows 50 - будет создан файл с 50 юзерами без пропусков
-    2. python main.py --rows 50 --null yes (или любой текст) - будет создан файл с 50 юзерами с пропусками, если это возможно
+
+    2. python main.py --rows 50 --null yes (или любой текст) - будет создан файл с 50 юзерами 
+    с пропусками, если это возможно
+
+    3. python main.py --rows 50 --crypt dummy --check yes - будет создан файл с 50 юзерами 
+    с "тупым" шифрованием и проверкой файлов за последние 60 дней
     '''
     parser = argparse.ArgumentParser()
     parser.add_argument('--rows', type=int, help='Нужное кол-во фейковых строк в CSV')
     parser.add_argument("--null", type=str, help='указать "yes" или что угодно, если требуется разбавлять файл null значениями')
+    parser.add_argument("--crypt", default='fernet', type=str, help='какое нужно шифрование: fernet | dummy | no')
+    parser.add_argument("--check", default='no', type=str, help='нужно ли проверить файлы за последние 60 дней и зашифровать их')
     args = parser.parse_args()
     logger.info(f'Start generating {args.rows} syntetic rows {'with' if args.null else 'without'} null values...')
 
@@ -227,7 +349,11 @@ if __name__ == '__main__':
     rdds = start_session_and_prepare_data()
 
     # инициализуем класс, собираем и дампим в файл
-    generator_synt_data = SynteticDataGenerator(row_count=args.rows, nullable=nullable, **rdds)
+    generator_synt_data = SynteticDataGenerator(row_count=args.rows, 
+                                                nullable=nullable, 
+                                                crypt_type=args.crypt,
+                                                need_check=args.check, 
+                                                **rdds)
 
     logger.info('Generating and collecting data...')
     generator_synt_data.collect_data()
