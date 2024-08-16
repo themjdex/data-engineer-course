@@ -17,7 +17,6 @@ object TaskStringProcessor extends App { /* extends App добавлен, так
 
     println(s"Processed strings: $result")
   }
-  
   // запускаем всю логику
   transformText(words)
 }
